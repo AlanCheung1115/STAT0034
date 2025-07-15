@@ -1,0 +1,360 @@
+---
+title: "Analysis"
+output: html_document
+date: "2025-06-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(forecast)
+library(glmnet)
+library(keras)
+```
+
+```{r}
+horse_minutes_prices_1 <- readRDS("~/Desktop/STAT 0034/horse_minutes_prices_1.rds") %>% drop_na()
+bf_prices_minutes_1 <- read_feather("~/Desktop/STAT 0034/bf_prices_minutes_1.feather")
+#horse_books_prices_1 <- readRDS("~/Desktop/STAT 0034/horse_books_prices_1.rds") 
+#horse_commentary_data_3 <- readRDS("~/Desktop/STAT 0034/horse_commentary_data_3.rds")
+```
+
+```{r}
+unique_race_id <- unique(horse_minutes_prices_1$race_id)
+horse_winners <- horse_minutes_prices_1 %>% filter(status == "Winner") %>% select(race_id, horse_id)
+cat( 'number of horses: ', nrow(horse_minutes_prices_1) )
+cat( '\nnumber of races: ', length(unique_race_id) )
+```
+
+# Data Preprocessing Functions
+```{r}
+# Weight of Money and Volume Weighted Average Price
+WOM_VWAP_PVT <- function(df) {
+  prefixes <- unique(sub("^(s_[^_]+).*", "\\1", colnames(df)))
+  back_VWAP <- data.frame(matrix(ncol = 0, nrow = nrow(df)))
+  lay_VWAP <- data.frame(matrix(ncol = 0, nrow = nrow(df)))
+  WOM <- data.frame(matrix(ncol = 0, nrow = nrow(df)))
+  back_PVT <- data.frame(matrix(ncol = 0, nrow = nrow(df)))
+  lay_PVT <- data.frame(matrix(ncol = 0, nrow = nrow(df)))
+  
+  for (prefix in rev(prefixes) ) {
+    if (prefix == 's_m30'){
+      next
+    }
+    
+    # Prepare column names for back prices and volumes
+    back_price_cols <- paste0(prefix, c("_back0_price", "_back1_price"))
+    back_volume_cols <- paste0(prefix, c("_back0_volume", "_back1_volume"))
+    lay_price_cols <- paste0(prefix, c("_lay0_price", "_lay1_price"))
+    lay_volume_cols <- paste0(prefix, c("_lay0_volume", "_lay1_volume"))
+    
+    # Keep only columns that actually exist in df
+    back_price_cols <- back_price_cols[back_price_cols %in% colnames(df)]
+    back_volume_cols <- back_volume_cols[back_volume_cols %in% colnames(df)]
+    lay_price_cols <- lay_price_cols[lay_price_cols %in% colnames(df)]
+    lay_volume_cols <- lay_volume_cols[lay_volume_cols %in% colnames(df)]
+    
+    # If no back or lay columns found, skip prefix
+    if (length(back_price_cols) == 0 | length(back_volume_cols) == 0 |
+        length(lay_price_cols) == 0 | length(lay_volume_cols) == 0) {
+      next
+    }
+    
+    back_prices <- df[, back_price_cols, drop = FALSE]
+    back_volumes <- df[, back_volume_cols, drop = FALSE]
+    lay_prices <- df[, lay_price_cols, drop = FALSE]
+    lay_volumes <- df[, lay_volume_cols, drop = FALSE]
+    
+    # WOM
+    back_weights <- back_volumes / seq_along(back_volumes)
+    lay_weights <- lay_volumes / seq_along(lay_volumes)
+    
+    W_back <- rowSums(back_weights)
+    W_lay <- rowSums(lay_weights)
+    
+    WOM[paste0(prefix, "_WOM")] <- W_back / (W_back + W_lay)
+    
+    #VWAP
+    back_VWAP[paste0(prefix, "_back_VWAP")] <- rowSums(back_prices * back_volumes) / rowSums(back_volumes)
+    lay_VWAP[paste0(prefix, "_lay_VWAP")] <- rowSums(lay_prices * lay_volumes) / rowSums(lay_volumes)
+    
+    #PVT
+    PVT <- function(prev_pvt, cur_p, prev_p, vol){
+      return(prev_pvt + ((cur_p-prev_p)/prev_p)*vol)
+    }
+
+    if (ncol(back_PVT)==0){
+      back_PVT[paste0(prefix, "_back_PVT")] <- rep(0, nrow(df))
+      lay_PVT[paste0(prefix, "_lay_PVT")] <- rep(0, nrow(df))
+    }
+    else{
+      back_PVT[paste0(prefix, "_back_PVT")] <- PVT(back_PVT[, ncol(back_PVT)],
+                                                   back_VWAP[, ncol(back_VWAP)], 
+                                                   back_VWAP[, ncol(back_VWAP)-1],
+                                                   rowSums(back_volumes))
+      lay_PVT[paste0(prefix, "_lay_PVT")] <- PVT(lay_PVT[, ncol(lay_PVT)],
+                                                   lay_VWAP[, ncol(lay_VWAP)], 
+                                                   lay_VWAP[, ncol(lay_VWAP)-1],
+                                                   rowSums(lay_volumes))
+    }
+    
+  }
+
+    return( list(WOM=WOM, back_VWAP=back_VWAP, lay_VWAP=lay_VWAP, back_PVT=back_PVT, lay_PVT= lay_PVT) )
+}
+
+# log Returns
+Log_Returns <- function(prices){
+  log_return <- as.data.frame( t( apply ( log( prices ), 1, diff ) ) )
+  colnames(log_return) <- paste0(names(log_return), "_log_return")
+  return(log_return)
+}
+```
+
+# Data Preprocessing
+```{r}
+wom_vwap_pvt_results <- WOM_VWAP_PVT(horse_minutes_prices_1)
+
+back_PVT <- data.frame( race_id = horse_minutes_prices_1$race_id, 
+                        wom_vwap_pvt_results$back_PVT )
+
+lay_PVT <- data.frame( race_id = horse_minutes_prices_1$race_id,
+                        wom_vwap_pvt_results$lay_PVT )
+
+back_data <- data.frame( race_id = horse_minutes_prices_1$race_id,
+                               horse_id = horse_minutes_prices_1$horse_id,
+                               WOM = wom_vwap_pvt_results$WOM$s_m60_WOM,
+                               back_PVT %>% group_by(race_id) %>% 
+                                            mutate(others_back_PVT = sum(s_m60_back_PVT)-s_m60_back_PVT) %>% 
+                                            ungroup() %>% select(others_back_PVT),
+                               Log_Returns(wom_vwap_pvt_results$back_VWAP))
+
+lay_data <- data.frame( race_id = horse_minutes_prices_1$race_id,
+                              horse_id = horse_minutes_prices_1$horse_id,
+                              WOM = wom_vwap_pvt_results$WOM$s_m60_WOM,
+                              lay_PVT %>% group_by(race_id) %>% 
+                                          mutate(others_lay_PVT = sum(s_m60_lay_PVT)-s_m60_lay_PVT) %>% 
+                                          ungroup() %>% select(others_lay_PVT),
+                              Log_Returns(wom_vwap_pvt_results$lay_VWAP))
+cur_back <- wom_vwap_pvt_results$back_VWAP$s_m60_back_VWAP
+cur_lay <- wom_vwap_pvt_results$lay_VWAP$s_m60_lay_VWAP
+future_back <- wom_vwap_pvt_results$back_VWAP$s_0_back_VWAP
+future_lay <- wom_vwap_pvt_results$lay_VWAP$s_0_lay_VWAP
+```
+
+# Profit stratefy given that we will use only 1 pound in total on back and lay
+```{r}
+Riskless_Profit <- function(cur_back, cur_lay, future_back, future_lay, forecast_back, forecast_lay){
+  
+  p <- NA
+  
+  forecast_p1 <- (forecast_back-cur_lay)/(forecast_back+cur_lay)
+  forecast_p2 <- (cur_back-forecast_lay)/(cur_back+forecast_lay)
+  
+  if (forecast_p1 > forecast_p2 && forecast_p1>0.001){
+    p <- (future_back-cur_lay)/(future_back+cur_lay)
+  }
+  
+  if (forecast_p2 > forecast_p1 && forecast_p2>0.001){
+    p <- (cur_back-future_lay)/(cur_back+future_lay)
+  }
+  
+  return(p)
+}
+
+Profits_Summary <- function(x) {
+  s <- summary(x)
+  s["Betted Race"] <- sum(!is.na(x))
+  s["Betting Rate"] <- sum(!is.na(x)) / length(x)
+  return(s)
+}
+```
+
+# Linear Regression
+```{r}
+OLS_Results <- function(train_indices, df, cur_prices, formula){
+  colnames(df)[ncol(df)] <- "resp"
+  train_data <- df[train_indices, ]
+  test_data <- df[-train_indices, ]
+  model <- lm(formula = formula, data = train_data)
+  forecasts <- cur_prices[-train_indices] * exp ( predict(model, newdata = test_data[,c(-ncol(df))]) )
+  return( list( forecasts=forecasts, model=model) )
+}
+RMSE <- function(future, forecasts){
+  return( sqrt( mean( (future-forecasts)**2 ) ) )
+}
+```
+
+```{r}
+set.seed(24070923)
+train_indices <- sample(seq_len( nrow(back_data) ), size = floor(0.3 * nrow(back_data)))
+```
+
+```{r}
+back_OLS_results <- OLS_Results(train_indices, back_data[,c(-1,-2)], cur_back,
+                                (resp ~ .) )
+lay_OLS_results <- OLS_Results(train_indices, lay_data[,c(-1,-2)], cur_lay,
+                               (resp ~ .) )
+
+OLS_riskless_profit <- mapply(Riskless_Profit, 
+                              cur_back[-train_indices], cur_lay[-train_indices], 
+                              future_back[-train_indices], future_lay[-train_indices],
+                              back_OLS_results$forecasts, lay_OLS_results$forecasts)
+
+print( Profits_Summary(OLS_riskless_profit) )
+
+print( paste("lay rmse: ", RMSE(future_lay[-train_indices], lay_OLS_results$forecasts),
+              " , back rmse: ", RMSE(future_back[-train_indices], back_OLS_results$forecasts)  ) )
+```
+
+# Linear Regression of log return with pairwise interaction
+```{r}
+for (i in 2:5){
+  f <- as.formula(paste("resp ~ .^", i))
+  inter_back_OLS_results <- OLS_Results(train_indices, back_data[,c(-1,-2)], cur_back, f)
+  inter_lay_OLS_results <- OLS_Results(train_indices, lay_data[,c(-1,-2)], cur_lay, f)
+  
+  inter_OLS_riskless_profit <- mapply(Riskless_Profit, 
+                                      cur_back[-train_indices], cur_lay[-train_indices], 
+                                      future_back[-train_indices], future_lay[-train_indices],
+                                      inter_back_OLS_results$forecasts, inter_lay_OLS_results$forecasts)
+
+  print( Profits_Summary(inter_OLS_riskless_profit) )
+
+  print( paste("lay rmse: ", RMSE(future_lay[-train_indices], inter_lay_OLS_results$forecasts),
+                " , back rmse: ", RMSE(future_back[-train_indices], inter_back_OLS_results$forecasts)  ) )
+}
+```
+#no interaction is better
+
+#Ridge and Lasso
+```{r}
+More_Reg_Results <- function(train_indices, df, cur_prices, formula, alpha){
+  colnames(df)[ncol(df)] <- "resp"
+  X <- model.matrix(formula, data = df)[, -1]
+  y <- df$resp
+  
+  model <- cv.glmnet(X[train_indices, ], y[train_indices], alpha = alpha)
+
+  forecasts <- cur_prices[-train_indices] * exp( predict(model, s=model$lambda.min, newx = X[-train_indices, ]) )
+
+  return( list( forecasts=forecasts, model=model) )
+}
+```
+
+#Ridge
+```{r}
+set.seed(24070923)
+
+back_ridge_results <- More_Reg_Results(train_indices, back_data[,c(-1,-2)], cur_back, resp ~ ., 0)
+lay_ridge_results <- More_Reg_Results(train_indices, lay_data[,c(-1,-2)], cur_lay, resp ~ ., 0)
+
+ridge_riskless_profit <- mapply(Riskless_Profit, 
+                                      cur_back[-train_indices], cur_lay[-train_indices], 
+                                      future_back[-train_indices], future_lay[-train_indices],
+                                      back_ridge_results$forecasts, lay_ridge_results$forecasts)
+
+print( Profits_Summary(ridge_riskless_profit) )
+
+print( paste("lay rmse: ", RMSE(future_lay[-train_indices], lay_ridge_results$forecasts),
+              " , back rmse: ", RMSE(future_back[-train_indices], back_ridge_results$forecasts)  ) )
+```
+
+#Ridge with interaction
+```{r}
+set.seed(24070923)
+
+for (i in 2:3){
+  f <- as.formula(paste("resp ~ .^", i))
+  inter_back_ridge_results <- More_Reg_Results(train_indices, back_data[,c(-1,-2)], cur_back, f, 0)
+  inter_lay_ridge_results <- More_Reg_Results(train_indices, lay_data[,c(-1,-2)], cur_lay, f, 0)
+  
+  inter_ridge_riskless_profit <- mapply(Riskless_Profit, 
+                                        cur_back[-train_indices], cur_lay[-train_indices], 
+                                        future_back[-train_indices], future_lay[-train_indices],
+                                        inter_back_ridge_results$forecasts, inter_lay_ridge_results$forecasts)
+  
+  print( Profits_Summary(inter_ridge_riskless_profit) )
+  
+  print( paste("lay rmse: ", RMSE(future_lay[-train_indices], inter_lay_ridge_results$forecasts),
+                " , back rmse: ", RMSE(future_back[-train_indices], inter_back_ridge_results$forecasts)  ) )
+}
+```
+
+#Lasso
+```{r}
+set.seed(24070923)
+
+back_lasso_results <- More_Reg_Results(train_indices, back_data[,c(-1,-2)], cur_back, resp ~ ., 1)
+lay_lasso_results <- More_Reg_Results(train_indices, lay_data[,c(-1,-2)], cur_lay, resp ~ ., 1)
+
+lasso_riskless_profit <- mapply(Riskless_Profit, 
+                                cur_back[-train_indices], cur_lay[-train_indices], 
+                                future_back[-train_indices], future_lay[-train_indices],
+                                back_lasso_results$forecasts, lay_lasso_results$forecasts)
+
+print( Profits_Summary(lasso_riskless_profit) )
+
+print( paste("lay rmse: ", RMSE(future_lay[-train_indices], lay_lasso_results$forecasts),
+              " , back rmse: ", RMSE(future_back[-train_indices], back_lasso_results$forecasts)  ) )
+```
+
+#Lasso with interaction
+```{r}
+set.seed(24070923)
+
+for (i in 2:3){
+  f <- as.formula(paste("resp ~ .^", i))
+  inter_back_lasso_results <- More_Reg_Results(train_indices, back_data[,c(-1,-2)], cur_back, f, 1)
+  inter_lay_lasso_results <- More_Reg_Results(train_indices, lay_data[,c(-1,-2)], cur_lay, f, 1)
+  
+  inter_lasso_riskless_profit <- mapply(Riskless_Profit, 
+                                        cur_back[-train_indices], cur_lay[-train_indices], 
+                                        future_back[-train_indices], future_lay[-train_indices],
+                                        inter_back_lasso_results$forecasts, inter_lay_lasso_results$forecasts)
+  
+  print( Profits_Summary(inter_lasso_riskless_profit) )
+  
+  print( paste("lay rmse: ", RMSE(future_lay[-train_indices], inter_lay_lasso_results$forecasts),
+                " , back rmse: ", RMSE(future_back[-train_indices], inter_back_lasso_results$forecasts)  ) )
+}
+```
+
+```{r}
+Perfect_riskless_profit <- mapply(Riskless_Profit, 
+                                    cur_back[-train_indices], cur_lay[-train_indices], 
+                                    future_back[-train_indices], future_lay[-train_indices],
+                                    future_back[-train_indices], future_lay[-train_indices])
+print( Profits_Summary(Perfect_riskless_profit) )
+```
+
+
+# LSTM
+
+```{r}
+# Create dummy sequence data: X has shape (samples, timesteps, features)
+X <- array(rnorm(10000 * 10 * 1), dim = c(10000, 10, 1))  # 10 time steps
+y <- rnorm(10000)
+
+# Define RNN model
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 64, input_shape = c(10, 1)) %>%
+  layer_dense(units = 1)
+
+# Compile and fit
+model %>% compile(
+  loss = 'mse',
+  optimizer = 'adam',
+  metrics = list('mae')
+)
+
+model %>% fit(X, y, epochs = 20, batch_size = 32, validation_split = 0.2)
+```
+
+
+
+
+
+
